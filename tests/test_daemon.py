@@ -454,3 +454,39 @@ def test_list_watched_includes_healthy_and_blocked_surfaces(
     assert by_id["healthy"]["blocked"] is False
     assert by_id["blocked"]["status"] == "sleeping"
     assert by_id["blocked"]["blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_poll_wait_is_capped_for_far_reset(
+    temp_state: Path, fake_client, fake_scheduler
+):
+    """A reset hours away must NOT park the loop: the wait is capped so the daemon
+    keeps re-polling other surfaces instead of sleeping for hours."""
+    settings = Settings(
+        state_file=str(temp_state),
+        ui_enabled=False,
+        max_sleep_seconds=60,
+        capture_dir=str(temp_state.parent / "captures"),
+    )
+    # No agent surfaces this poll, so the pre-seeded sleeping block survives.
+    fake_client.list_surfaces = AsyncMock(return_value=[])
+    daemon = Daemon(config=settings, client=fake_client, scheduler=fake_scheduler)
+    now = datetime.now(timezone.utc)
+    daemon._states["s1"] = BlockState(
+        surface_id="s1",
+        agent_kind="claude",
+        detected_at=now,
+        reset_at=now + timedelta(hours=3),  # far away
+        status=BlockStatus.SLEEPING,
+        armed=True,
+    )
+
+    before = datetime.now(timezone.utc)
+    await daemon._poll_once()
+
+    fake_scheduler.schedule.assert_awaited_once()
+    scheduled_target = fake_scheduler.schedule.await_args.args[0]
+    waited = (scheduled_target - before).total_seconds()
+    # Capped near max_sleep_seconds, NOT the ~3h (10800s) reset.
+    assert waited <= settings.max_sleep_seconds + 2
+    assert daemon._states["s1"].status == BlockStatus.SLEEPING  # still tracked

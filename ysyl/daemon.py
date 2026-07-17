@@ -413,8 +413,21 @@ class Daemon:
 
         target = self._earliest_reset(now)
         if target is not None:
-            logger.info("Waiting until %s for next reset", target.isoformat())
-            await self._wait_for(target)
+            # Never park the whole loop on a single far-off reset: cap the wait so
+            # we keep re-polling (catch new blocks on other surfaces, let a stale
+            # or false-positive block self-clear). When the reset is near, we still
+            # wait exactly until it so the resume fires promptly.
+            seconds = (target - now).total_seconds()
+            capped = min(seconds, self.config.max_sleep_seconds)
+            wait_target = now + timedelta(seconds=max(capped, 1))
+            if capped >= seconds:
+                logger.info("Waiting until %s for next reset", target.isoformat())
+            else:
+                logger.debug(
+                    "Next reset %s is far; re-polling in %ss",
+                    target.isoformat(), self.config.max_sleep_seconds,
+                )
+            await self._wait_for(wait_target)
         else:
             await self._idle_wait()
 

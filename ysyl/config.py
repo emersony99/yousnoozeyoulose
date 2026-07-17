@@ -51,6 +51,13 @@ class Settings(BaseSettings):
 
     poll_interval_seconds: int = Field(default=10, ge=1, description="Seconds between surface polls.")
     sleep_tick_seconds: int = Field(default=30, ge=1, description="Scheduler sleep chunk size.")
+    max_sleep_seconds: int = Field(
+        default=60,
+        ge=1,
+        description="Upper bound on how long the daemon waits for a reset before it "
+        "re-polls. Keeps it responsive to new blocks on other surfaces and lets a "
+        "stale/false-positive block self-clear, even when the nearest reset is hours away.",
+    )
     cmux_bin: str = Field(
         default_factory=_resolve_cmux_bin,
         description="Path to the cmux CLI binary. Auto-resolved from cmux env/PATH if unset.",
