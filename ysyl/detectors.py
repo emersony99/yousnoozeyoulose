@@ -81,11 +81,13 @@ class ClaudeDetector:
 
     agent_kind = "claude"
 
-    # Any of these phrases is treated as evidence the session is blocked/limited.
-    _DEFAULT_BANNER_PATTERNS = (
+    # Strong phrases: real Claude limit banners use wording like this.
+    _STRONG_BANNER_PATTERNS = (
         r"usage limit",
-        r"rate limit",
-        r"reached your (?:usage |weekly )?limit",
+        r"session limit",
+        r"weekly limit",
+        r"reached your (?:usage |weekly |session )?limit",
+        r"hit your (?:usage |session |weekly )?limit",
         r"you have reached",
         r"limit reached",
         r"usage will reset",
@@ -93,11 +95,17 @@ class ClaudeDetector:
         r"limit will reset",
         r"limit resets",
         r"\d+-hour limit",
-        r"weekly limit",
         r"too many requests",
-        r"please try again later",
         r"approaching (?:your )?usage limit",
         r"out of (?:usage|credits)",
+    )
+
+    # Weak phrases: they appear in ordinary conversation about rate limits and
+    # stack traces, so we only treat them as a block when a reset time is also
+    # parseable nearby (avoids false positives).
+    _WEAK_BANNER_PATTERNS = (
+        r"rate limit",
+        r"please try again later",
     )
 
     # Absolute reset time: "reset at 2:30 PM PDT", "resets 3pm (America/New_York)",
@@ -117,15 +125,24 @@ class ClaudeDetector:
     )
 
     def __init__(self, extra_banner_patterns: list[str] | None = None) -> None:
-        patterns = list(self._DEFAULT_BANNER_PATTERNS) + list(extra_banner_patterns or [])
-        self._banner_re = re.compile("(" + "|".join(patterns) + ")", re.IGNORECASE)
+        strong = list(self._STRONG_BANNER_PATTERNS) + list(extra_banner_patterns or [])
+        self._strong_banner_re = re.compile("(" + "|".join(strong) + ")", re.IGNORECASE)
+        self._weak_banner_re = re.compile(
+            "(" + "|".join(self._WEAK_BANNER_PATTERNS) + ")", re.IGNORECASE
+        )
 
     def detect(self, text: str, *, now: datetime | None = None) -> BlockState | None:
         now = now or datetime.now(timezone.utc)
-        if not self._banner_re.search(text):
+        strong = self._strong_banner_re.search(text)
+        weak = self._weak_banner_re.search(text)
+        if not strong and not weak:
             return None
 
         reset_at = self._parse_absolute(text, now) or self._parse_relative(text, now)
+        if not strong and reset_at is None:
+            # Weak phrase (e.g. "rate limit" in scrollback) with no reset time.
+            return None
+
         return BlockState(
             surface_id="",
             agent_kind="claude",
@@ -174,16 +191,14 @@ class KimiDetector:
     agent_kind = "kimi"
 
     _DEFAULT_INDICATOR_PATTERNS = (
-        r"429",
+        r"429\s+(?:too many requests|rate limit)",
         r"too many requests",
-        r"rate limit",
         r"token quota",
         r"quota exceeded",
         r"requests are limited",
         r"请稍后重试",
-        r"try again later",
-        r"retry after",
         r"insufficient quota",
+        r"retry after",
     )
     _RETRY_SECONDS_RE = re.compile(
         r"(?:retry after|try again in)\s+(\d+)\s*(?:s|sec|seconds?)\b",
@@ -242,18 +257,24 @@ def detect_all(
     *,
     enabled: dict[str, bool] | None = None,
     detectors: list[AgentDetector] | None = None,
+    preferred_kind: str | None = None,
 ) -> BlockState | None:
-    """Run enabled detectors in order and return the first positive match.
+    """Run enabled detectors and return the first positive match.
 
     Args:
         text: Surface text to inspect.
         now: Current UTC datetime.
         enabled: Map of agent name to enabled flag. Defaults to both enabled.
         detectors: Optional list of detector instances to use.
+        preferred_kind: If provided (e.g. from cmux ``resume_binding.kind``), only
+            that detector is run. This prevents a Claude Code session whose
+            conversation happens to mention Kimi from being misclassified.
     """
     enabled = enabled or {"claude": True, "kimi": True}
     detectors = detectors if detectors is not None else build_detectors()
     for detector in detectors:
+        if preferred_kind and detector.agent_kind != preferred_kind:
+            continue
         if not enabled.get(detector.agent_kind, False):
             continue
         result = detector.detect(text, now=now)

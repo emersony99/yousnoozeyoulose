@@ -17,6 +17,8 @@ from ysyl.webui import WebUI
 
 @pytest.fixture
 def daemon(tmp_path: Path):
+    from ysyl.models import SurfaceRef
+
     settings = Settings(
         state_file=str(tmp_path / "state.json"),
         ui_enabled=False,
@@ -36,6 +38,11 @@ def daemon(tmp_path: Path):
         armed=True,
         title="claude",
         ref="surface:1",
+    )
+    d._watched["s1"] = SurfaceRef(
+        surface_id="s1",
+        ref="surface:1",
+        title="claude",
     )
     return d
 
@@ -87,7 +94,7 @@ async def test_resume_now_endpoint(daemon):
         "POST", "/api/resume_now", json.dumps({"surface_id": "s1"}).encode()
     )
     assert json.loads(body)["ok"] is True
-    daemon.client.send_key.assert_awaited_once_with("s1", "return")
+    daemon.client.send_text.assert_awaited_once_with("s1", "resume\n")
     assert daemon._states["s1"].status == BlockStatus.RESUMED
 
 
@@ -100,3 +107,13 @@ async def test_bad_requests(daemon):
     assert status == 400
     status, _, _ = await ui._route("POST", "/api/arm", b"{}")
     assert status == 400  # missing surface_id
+
+
+@pytest.mark.asyncio
+async def test_resume_now_reports_failure_for_missing_surface(daemon):
+    ui = WebUI(daemon)
+    status, _, body = await ui._route(
+        "POST", "/api/resume_now", json.dumps({"surface_id": "missing"}).encode()
+    )
+    assert status == 200
+    assert json.loads(body)["ok"] is False

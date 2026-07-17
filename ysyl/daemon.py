@@ -58,6 +58,7 @@ class Daemon:
         self.scheduler = scheduler or WakeScheduler(config.sleep_tick_seconds)
         self.state_file = Path(config.state_file).expanduser()
         self._states: dict[str, BlockState] = {}
+        self._watched: dict[str, SurfaceRef] = {}
         self._shutdown = asyncio.Event()
         self._detectors = build_detectors(config.detector_banner_patterns)
         self._webui = None
@@ -110,22 +111,75 @@ class Daemon:
         """Return all tracked block states."""
         return list(self._states.values())
 
-    # ----------------------------------------------------------- surface logic
-    def _is_agent_surface(self, surface) -> bool:
-        """Return True when a surface looks like a Claude/Kimi agent pane.
+    def list_watched(self) -> list[dict]:
+        """Return every agent surface being watched, with optional block state."""
+        now = datetime.now(timezone.utc)
+        rows: list[dict] = []
+        for surface_id, surface in self._watched.items():
+            block = self._states.get(surface_id)
+            seconds = None
+            if block and block.reset_at is not None:
+                seconds = int((block.reset_at - now).total_seconds())
+            rows.append(
+                {
+                    "surface_id": surface_id,
+                    "ref": getattr(surface, "ref", None),
+                    "title": getattr(surface, "title", None),
+                    "agent_kind": block.agent_kind if block else self._infer_agent_kind(surface),
+                    "status": block.status if block else "healthy",
+                    "armed": block.armed if block else True,
+                    "reset_at": block.reset_at.isoformat() if block and block.reset_at else None,
+                    "seconds_until_reset": seconds,
+                    "retry_count": block.retry_count if block else 0,
+                    "preview": block.preview if block else None,
+                    "blocked": block is not None,
+                }
+            )
+        return rows
 
-        Reliable signal: cmux tags wrapped agents with ``resume_binding.kind``
-        (surfaced as ``resume_kind``). Fallback: configurable title/command
-        substring match.
-        """
-        kind = getattr(surface, "resume_kind", None)
-        if isinstance(kind, str) and kind.lower() in ("claude", "kimi"):
-            return True
-        haystack = " ".join(
+    # ----------------------------------------------------------- surface logic
+    def _haystack(self, surface) -> str:
+        return " ".join(
             str(getattr(surface, attr, "") or "")
             for attr in ("title", "initial_command", "ref")
         ).lower()
+
+    def _matches_title_patterns(self, surface) -> bool:
+        haystack = self._haystack(surface)
         return any(pat.lower() in haystack for pat in self.config.agent_title_patterns)
+
+    def _infer_agent_kind(self, surface) -> str | None:
+        """Best-effort agent kind from cmux surface metadata.
+
+        Priority:
+        1. cmux ``resume_binding.kind`` (the most reliable signal).
+        2. Title / initial_command / ref substring heuristics that map to a
+           known agent kind ("claude" or "kimi"). Ambiguous patterns such as
+           "role:" only tell us the surface is an agent session, not which one,
+           so they return ``None`` and both detectors are tried.
+        """
+        kind = getattr(surface, "resume_kind", None)
+        if isinstance(kind, str) and kind.lower() in ("claude", "kimi"):
+            return kind.lower()
+
+        haystack = self._haystack(surface)
+        for pat in self.config.agent_title_patterns:
+            if pat.lower() not in haystack:
+                continue
+            lowered = pat.lower()
+            if lowered in ("claude", "kimi"):
+                return lowered
+            # Ambiguous pattern (e.g. "role:"): surface is an agent, but we
+            # need to read the text to know which one.
+            return None
+        return None
+
+    def _is_agent_surface(self, surface) -> bool:
+        """Return True when a surface looks like a Claude/Kimi agent pane."""
+        kind = getattr(surface, "resume_kind", None)
+        if isinstance(kind, str) and kind.lower() in ("claude", "kimi"):
+            return True
+        return self._matches_title_patterns(surface)
 
     def _backoff(self, attempt: int) -> timedelta:
         """Exponential backoff (5 min → capped at 60 min) for retries/unknown resets."""
@@ -146,6 +200,22 @@ class Daemon:
         except OSError as exc:
             logger.warning("Capture failed for %s: %s", surface_id, exc)
 
+    def _debug_snapshot(self, surface_id: str, text: str, kind: str | None) -> None:
+        """Overwrite a single latest-snapshot file for a surface (debug mode only).
+
+        This avoids filling disk with a new file on every poll.
+        """
+        try:
+            directory = Path(self.config.capture_dir).expanduser()
+            directory.mkdir(parents=True, exist_ok=True)
+            safe = surface_id.replace("/", "_")
+            path = directory / f"{safe}-latest.txt"
+            stamp = datetime.now(timezone.utc).isoformat()
+            header = f"# ysyl debug snapshot kind={kind} surface={surface_id} at={stamp}\n\n"
+            path.write_text(header + text, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Debug snapshot failed for %s: %s", surface_id, exc)
+
     def _detect_region(self, text: str) -> str:
         """The live tail of a surface — where a real limit banner appears.
 
@@ -155,7 +225,15 @@ class Daemon:
         """
         return "\n".join(text.splitlines()[-self.config.tail_lines:])
 
-    def _observe(self, surface_id: str, title, ref, text: str, now: datetime) -> None:
+    def _observe(
+        self,
+        surface_id: str,
+        title,
+        ref,
+        text: str,
+        now: datetime,
+        preferred_kind: str | None = None,
+    ) -> None:
         """Update tracked state for one agent surface from its current text."""
         title = _str_or_none(title)
         ref = _str_or_none(ref)
@@ -163,12 +241,23 @@ class Daemon:
         if existing is not None and existing.status == "dismissed":
             return
 
+        region = self._detect_region(text)
         block = detect_all(
-            self._detect_region(text),
+            region,
             now,
             enabled=self.config.agents,
             detectors=self._detectors,
+            preferred_kind=preferred_kind,
         )
+
+        if self.config.debug_mode:
+            logger.debug(
+                "Scanned %s (kind=%s): detector=%s",
+                ref or surface_id,
+                preferred_kind,
+                block.agent_kind if block else None,
+            )
+            self._debug_snapshot(surface_id, text, preferred_kind)
 
         if block is None:
             # No limit banner visible. If we were tracking a block, it cleared.
@@ -206,6 +295,18 @@ class Daemon:
         existing.title = title
         existing.ref = ref
         existing.preview = preview
+        if block.agent_kind != existing.agent_kind:
+            logger.info(
+                "Updating agent kind for %s: %s -> %s",
+                ref or surface_id,
+                existing.agent_kind,
+                block.agent_kind,
+            )
+            existing.agent_kind = block.agent_kind
+            # A reclassification is effectively a fresh detection; clear stale
+            # retry state so the correct detector's reset time is honored.
+            existing.retry_count = 0
+            existing.status = "sleeping" if existing.armed else "detected"
         if block.reset_at is not None:
             existing.reset_at = block.reset_at
 
@@ -242,6 +343,34 @@ class Daemon:
         ]
         return min(candidates) if candidates else None
 
+    def _prune_stale_states(self, now: datetime, live_surface_ids: set[str]) -> None:
+        """Remove blocks for closed surfaces and old resumed/dismissed rows."""
+        to_remove: list[str] = []
+        for surface_id, block in self._states.items():
+            if surface_id not in live_surface_ids:
+                # Surface no longer exists in cmux.
+                if block.status in ("resumed", "dismissed"):
+                    to_remove.append(surface_id)
+                elif block.status == "sleeping" and block.armed:
+                    # Keep tracking a sleeping block even if the surface briefly
+                    # disappears from the list (cmux list can be momentarily stale).
+                    continue
+                else:
+                    to_remove.append(surface_id)
+                continue
+
+            age = now - block.detected_at
+            if block.status == "resumed" and self.config.prune_resumed_after_hours > 0:
+                if age >= timedelta(hours=self.config.prune_resumed_after_hours):
+                    to_remove.append(surface_id)
+            elif block.status == "dismissed" and self.config.prune_dismissed_after_hours > 0:
+                if age >= timedelta(hours=self.config.prune_dismissed_after_hours):
+                    to_remove.append(surface_id)
+
+        for surface_id in to_remove:
+            logger.debug("Pruning stale state for %s", surface_id)
+            self._states.pop(surface_id, None)
+
     async def _poll_once(self) -> None:
         """List surfaces, update state, then wait until the next reset is due."""
         now = datetime.now(timezone.utc)
@@ -252,13 +381,18 @@ class Daemon:
             await self._idle_wait()
             return
 
+        live_surface_ids: set[str] = set()
+        watched: dict[str, SurfaceRef] = {}
         for surface in surfaces:
             surface_id = getattr(surface, "surface_id", "") or ""
             if not surface_id or not self._is_agent_surface(surface):
                 continue
+            live_surface_ids.add(surface_id)
+            watched[surface_id] = surface
             existing = self._states.get(surface_id)
             if existing is not None and existing.status == "dismissed":
                 continue
+            kind = self._infer_agent_kind(surface)
             try:
                 text = await self.client.read_surface_text(surface_id)
             except CmuxError as exc:
@@ -270,8 +404,11 @@ class Daemon:
                 getattr(surface, "ref", None),
                 text,
                 now,
+                preferred_kind=kind,
             )
 
+        self._watched = watched
+        self._prune_stale_states(now, live_surface_ids)
         self.save_state()
 
         target = self._earliest_reset(now)
@@ -324,31 +461,71 @@ class Daemon:
                 continue
             await self._resume_surface(surface_id)
 
-    async def _resume_surface(self, surface_id: str) -> None:
-        """Send the resume action to a blocked agent surface."""
+    async def _resume_surface(self, surface_id: str) -> bool:
+        """Send the resume action to a blocked agent surface and verify it sent.
+
+        Returns True if the keystroke/text was delivered. A delivery failure is
+        treated as a retry-worthy error; the caller observes the surface again on
+        the next poll to decide whether the limit actually cleared.
+        """
         block = self._states.get(surface_id)
         if block is None:
-            return
+            logger.warning("Resume requested for unknown surface %s", surface_id)
+            return False
+
+        spec = self.config.agent_resume_actions.get(
+            block.agent_kind,
+            f"{self.config.resume_action}:{self.config.resume_text}",
+        )
+        spec = spec.lower()
+        if spec == "enter":
+            action, detail = "enter", "return"
+        elif spec.startswith("text:"):
+            action, detail = "text", spec.split(":", 1)[1]
+        else:
+            # Should be caught by config validation; fall back to Enter.
+            action, detail = "enter", "return"
+
+        logger.info(
+            "Resuming %s (%s) with %s=%r",
+            block.ref or surface_id,
+            block.agent_kind,
+            action,
+            detail,
+        )
+
         try:
-            if self.config.resume_action == "text":
-                await self.client.send_text(block.surface_id, self.config.resume_text + "\n")
+            if action == "text":
+                await self.client.send_text(block.surface_id, detail + "\n")
             else:
                 await self.client.send_key(block.surface_id, "return")
-            block.status = "resumed"
-            block.retry_count += 1
-            logger.info(
-                "Resumed %s (%s), attempt %d",
-                block.ref or surface_id,
-                block.agent_kind,
-                block.retry_count,
-            )
         except CmuxError as exc:
             block.retry_count += 1
             logger.warning("Resume failed for %s: %s", block.ref or surface_id, exc)
+            self._capture(surface_id, "", reason=f"resume-delivery-error-{exc}")
             if block.retry_count >= self.config.max_retries:
                 logger.warning("Dismissing %s after %d failures", surface_id, block.retry_count)
                 block.status = "dismissed"
+            self.save_state()
+            return False
+
+        block.status = "resumed"
+        block.retry_count += 1
         self.save_state()
+        logger.info(
+            "Resumed %s (%s), attempt %d",
+            block.ref or surface_id,
+            block.agent_kind,
+            block.retry_count,
+        )
+
+        if self.config.resume_verify_delay_seconds > 0:
+            try:
+                await asyncio.sleep(self.config.resume_verify_delay_seconds)
+            except asyncio.CancelledError:
+                pass
+
+        return True
 
     # ----------------------------------------------------------- user actions
     def dismiss(self, surface_id: str) -> bool:

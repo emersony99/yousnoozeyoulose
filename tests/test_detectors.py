@@ -105,3 +105,46 @@ def test_claude_unparseable_reset_still_detects():
     assert result is not None
     assert result.agent_kind == "claude"
     assert result.reset_at is None  # daemon applies a backoff instead
+
+
+def test_claude_detects_session_limit():
+    text = "You've hit your session limit · resets 4:50am (America/Vancouver)"
+    result = ClaudeDetector().detect(text, now=NOW)
+    assert result is not None
+    assert result.agent_kind == "claude"
+    assert result.reset_at is not None
+
+
+def test_claude_weak_rate_limit_without_reset_is_ignored():
+    # Mere discussion of rate limits should not trigger a block.
+    text = "The agent was discussing rate limits and said please try again later."
+    assert ClaudeDetector().detect(text, now=NOW) is None
+
+
+def test_claude_weak_rate_limit_with_reset_is_detected():
+    text = "Rate limited. Please try again later. Resets in 15 minutes."
+    result = ClaudeDetector().detect(text, now=NOW)
+    assert result is not None
+    assert result.agent_kind == "claude"
+    assert result.reset_at == NOW + timedelta(minutes=15)
+
+
+def test_kimi_ignores_bare_429_in_stack_trace():
+    text = "File 'x.py', line 429, in helper\nValueError: bad"
+    assert KimiDetector().detect(text, now=NOW) is None
+
+
+def test_kimi_ignores_conversation_about_rate_limits():
+    text = "We should handle rate limit errors by asking the user to try again later."
+    assert KimiDetector().detect(text, now=NOW) is None
+
+
+def test_detect_all_uses_preferred_kind():
+    # Text mentions both Claude and Kimi-style phrases, but metadata says claude.
+    text = "Claude Code\nToken quota exceeded, retry after 300s"
+    result = detect_all(text, NOW, preferred_kind="claude")
+    assert result is None  # Claude detector won't match Kimi-style text
+
+    result = detect_all(text, NOW, preferred_kind="kimi")
+    assert result is not None
+    assert result.agent_kind == "kimi"

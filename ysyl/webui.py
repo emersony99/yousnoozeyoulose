@@ -46,30 +46,13 @@ class WebUI:
 
     # ------------------------------------------------------------- snapshot
     def snapshot(self) -> dict:
-        """A JSON-friendly view of all tracked surfaces."""
+        """A JSON-friendly view of all watched agent surfaces."""
         now = datetime.now(timezone.utc)
-        rows = []
-        for block in self.daemon.list_states():
-            seconds = None
-            if block.reset_at is not None:
-                seconds = int((block.reset_at - now).total_seconds())
-            rows.append(
-                {
-                    "surface_id": block.surface_id,
-                    "ref": block.ref,
-                    "title": block.title,
-                    "agent_kind": block.agent_kind,
-                    "status": str(block.status),
-                    "armed": bool(block.armed),
-                    "reset_at": block.reset_at.isoformat() if block.reset_at else None,
-                    "seconds_until_reset": seconds,
-                    "retry_count": block.retry_count,
-                    "preview": block.preview,
-                }
-            )
-        # Locked-on / soon-to-resume first: sleeping+armed with nearest reset.
+        rows = self.daemon.list_watched()
+        # Blocked / sleeping / armed first, then healthy.
         rows.sort(
             key=lambda r: (
+                0 if r.get("blocked") else 1,
                 0 if (r["status"] == "sleeping" and r["armed"]) else 1,
                 r["seconds_until_reset"] if r["seconds_until_reset"] is not None else 1 << 30,
             )
@@ -99,8 +82,7 @@ class WebUI:
             elif path == "/api/dismiss":
                 ok = self.daemon.dismiss(surface_id)
             else:  # /api/resume_now
-                await self.daemon._resume_surface(surface_id)
-                ok = True
+                ok = await self.daemon._resume_surface(surface_id)
             return 200, "application/json", json.dumps({"ok": bool(ok)}).encode("utf-8")
 
         return 404, "application/json", b'{"ok": false, "error": "not found"}'
@@ -185,6 +167,7 @@ _PAGE = """<!doctype html>
   .st-resumed  { background: #143d2b; color: #7ee2a8; }
   .st-detected { background: #4a3a12; color: #f0cf7a; }
   .st-dismissed{ background: #3a2030; color: #e79bc0; }
+  .st-healthy  { background: #1f2a1f; color: #7ee2a8; }
   .count { font-variant-numeric: tabular-nums; font-weight: 600; }
   .muted { opacity: .55; }
   .preview { max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -232,9 +215,12 @@ async function refresh() {
   try { data = await (await fetch("/api/state")).json(); }
   catch(e){ document.getElementById("sub").textContent = "daemon unreachable"; return; }
   const rows = data.surfaces || [];
+  const blocked = rows.filter(r => r.blocked);
+  const healthy = rows.filter(r => !r.blocked);
   document.getElementById("sub").textContent =
-    rows.length + " agent surface" + (rows.length===1?"":"s") + " tracked · updated " +
-    new Date(data.now).toLocaleTimeString();
+    rows.length + " agent surface" + (rows.length===1?"":"s") + " tracked" +
+    (healthy.length ? " (" + healthy.length + " healthy)" : "") +
+    " · updated " + new Date(data.now).toLocaleTimeString();
   const tb = document.getElementById("rows");
   document.getElementById("empty").hidden = rows.length !== 0;
   tb.innerHTML = rows.map(r => {
@@ -242,19 +228,24 @@ async function refresh() {
     const st = esc(r.status);
     const checked = r.armed ? "checked" : "";
     const dismissed = r.status === "dismissed";
+    const isHealthy = r.status === "healthy";
+    const actions = isHealthy
+      ? `<span class="muted">watching</span>`
+      : `<button onclick="post('/api/resume_now',{surface_id:'${r.surface_id}'})">Resume now</button>
+         <button onclick="post('/api/dismiss',{surface_id:'${r.surface_id}'}" ${dismissed?"disabled":""}>Dismiss</button>`;
+    const armCell = isHealthy
+      ? `<span class="muted">—</span>`
+      : `<label class="arm"><input type="checkbox" ${checked} ${dismissed?"disabled":""}
+           onchange="post('/api/arm',{surface_id:'${r.surface_id}',armed:this.checked})"> armed</label>`;
     return `<tr>
       <td><div>${name}</div><div class="muted">${esc(r.ref||"")}</div></td>
-      <td>${esc(r.agent_kind)}</td>
+      <td>${esc(r.agent_kind || "—")}</td>
       <td><span class="badge st-${st}">${st}</span></td>
       <td class="count">${fmt(r.seconds_until_reset)}</td>
       <td>${r.retry_count}</td>
       <td class="preview" title="${esc(r.preview||"")}">${esc(r.preview||"")}</td>
-      <td><label class="arm"><input type="checkbox" ${checked} ${dismissed?"disabled":""}
-           onchange="post('/api/arm',{surface_id:'${r.surface_id}',armed:this.checked})"> armed</label></td>
-      <td>
-        <button onclick="post('/api/resume_now',{surface_id:'${r.surface_id}'})">Resume now</button>
-        <button onclick="post('/api/dismiss',{surface_id:'${r.surface_id}'})" ${dismissed?"disabled":""}>Dismiss</button>
-      </td>
+      <td>${armCell}</td>
+      <td>${actions}</td>
     </tr>`;
   }).join("");
 }

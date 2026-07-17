@@ -28,6 +28,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--state", type=str, help="Path to the state JSON file.")
     run_parser.add_argument("--interval", type=int, help="Poll interval in seconds.")
     run_parser.add_argument("--tick", type=int, help="Scheduler tick in seconds.")
+    run_parser.add_argument("--debug", action="store_true", help="Enable debug captures and verbose logging.")
     run_parser.add_argument("--no-ui", action="store_true", help="Disable the local dashboard.")
     run_parser.add_argument("--ui-host", type=str, help="Dashboard bind host (default 127.0.0.1).")
     run_parser.add_argument("--ui-port", type=int, help="Dashboard port (default 8765).")
@@ -62,6 +63,9 @@ def _load_settings(args: argparse.Namespace) -> Settings:
         kwargs["poll_interval_seconds"] = args.interval
     if getattr(args, "tick", None):
         kwargs["sleep_tick_seconds"] = args.tick
+    if getattr(args, "debug", False):
+        kwargs["debug_mode"] = True
+        kwargs["log_level"] = "DEBUG"
     if getattr(args, "no_ui", False):
         kwargs["ui_enabled"] = False
     if getattr(args, "ui_host", None):
@@ -120,33 +124,56 @@ def _read_blocks(state_file: Path) -> list[dict]:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    state_file = Path(args.state or Settings().state_file).expanduser()
-    if not state_file.exists():
-        print("No state file found.", file=sys.stderr)
-        return 1
-    try:
-        blocks = _read_blocks(state_file)
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"Failed to read state: {exc}", file=sys.stderr)
-        return 1
+    settings = Settings(state_file=args.state) if args.state else Settings()
+    daemon = Daemon(config=settings)
+    daemon._load_state()
 
     if getattr(args, "json", False):
-        print(json.dumps(blocks, indent=2))
+        print(json.dumps([b.to_state_dict() for b in daemon.list_states()], indent=2))
         return 0
 
-    if not blocks:
+    # Try to list live surfaces so healthy agent tabs are shown too.
+    try:
+        surfaces = asyncio.run(daemon.client.list_surfaces())
+        daemon._watched = {
+            s.surface_id: s for s in surfaces if daemon._is_agent_surface(s)
+        }
+    except Exception as exc:
+        if settings.log_level == "DEBUG":
+            print(f"Could not list live surfaces: {exc}", file=sys.stderr)
+
+    rows = daemon.list_watched()
+    if not rows:
+        # cmux may be unreachable; fall back to persisted block states.
+        rows = [
+            {
+                "surface_id": b.surface_id,
+                "ref": b.ref,
+                "title": b.title,
+                "agent_kind": b.agent_kind,
+                "status": b.status,
+                "armed": b.armed,
+                "reset_at": b.reset_at.isoformat() if b.reset_at else None,
+                "retry_count": b.retry_count,
+                "blocked": True,
+            }
+            for b in daemon.list_states()
+        ]
+
+    if not rows:
         print("No tracked surfaces.")
         return 0
 
-    header = f"{'SURFACE':<26} {'AGENT':<7} {'STATUS':<10} {'ARMED':<6} {'RESUMES IN':<12} {'TRIES':<5}"
+    header = f"{'SURFACE':<30} {'AGENT':<7} {'STATUS':<10} {'ARMED':<6} {'RESUMES IN':<12} {'TRIES':<5}"
     print(header)
     print("-" * len(header))
-    for b in blocks:
-        name = (b.get("title") or b.get("ref") or b.get("surface_id") or "")[:25]
-        armed = "yes" if b.get("armed", True) else "no"
+    for r in rows:
+        name = (r.get("title") or r.get("ref") or r.get("surface_id") or "")[:29]
+        armed = "yes" if r.get("armed", True) else "no"
         print(
-            f"{name:<26} {str(b.get('agent_kind','')):<7} {str(b.get('status','')):<10} "
-            f"{armed:<6} {_fmt_countdown(b.get('reset_at')):<12} {b.get('retry_count',0):<5}"
+            f"{name:<30} {str(r.get('agent_kind') or ''):<7} "
+            f"{str(r.get('status','')):<10} {armed:<6} "
+            f"{_fmt_countdown(r.get('reset_at')):<12} {r.get('retry_count',0):<5}"
         )
     return 0
 

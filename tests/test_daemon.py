@@ -87,7 +87,7 @@ async def test_daemon_detects_block_and_schedules_wake(
 
 
 @pytest.mark.asyncio
-async def test_daemon_resumes_claude_with_return(
+async def test_daemon_resumes_claude_with_text_resume(
     temp_state: Path, fake_settings: Settings, fake_client, fake_scheduler
 ):
     detected = datetime.now(timezone.utc)
@@ -103,9 +103,50 @@ async def test_daemon_resumes_claude_with_return(
 
     await daemon._resume_surface("s1")
 
-    fake_client.send_key.assert_awaited_once_with("s1", "return")
+    fake_client.send_text.assert_awaited_once_with("s1", "resume\n")
     assert daemon._states["s1"].status == BlockStatus.RESUMED
     assert daemon._states["s1"].retry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_resumes_kimi_with_text_resume(
+    temp_state: Path, fake_settings: Settings, fake_client, fake_scheduler
+):
+    detected = datetime.now(timezone.utc)
+    block = BlockState(
+        surface_id="s1",
+        agent_kind="kimi",
+        detected_at=detected,
+        reset_at=detected,
+        status=BlockStatus.SLEEPING,
+    )
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    daemon._states["s1"] = block
+
+    await daemon._resume_surface("s1")
+
+    fake_client.send_text.assert_awaited_once_with("s1", "resume\n")
+    assert daemon._states["s1"].status == BlockStatus.RESUMED
+
+
+@pytest.mark.asyncio
+async def test_daemon_respects_per_agent_enter_override(
+    temp_state: Path, fake_settings: Settings, fake_client, fake_scheduler
+):
+    fake_settings.agent_resume_actions = {"claude": "enter"}
+    detected = datetime.now(timezone.utc)
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    daemon._states["s1"] = BlockState(
+        surface_id="s1",
+        agent_kind="claude",
+        detected_at=detected,
+        reset_at=detected,
+        status=BlockStatus.SLEEPING,
+    )
+
+    await daemon._resume_surface("s1")
+
+    fake_client.send_key.assert_awaited_once_with("s1", "return")
 
 
 @pytest.mark.asyncio
@@ -145,10 +186,33 @@ def test_is_agent_surface(fake_settings: Settings, fake_client, fake_scheduler):
     assert daemon._is_agent_surface(
         SurfaceRef(surface_id="c", initial_command="/usr/bin/kimi chat")
     )
+    # Ambiguous agent prompt prefix still counts as an agent surface.
+    assert daemon._is_agent_surface(
+        SurfaceRef(surface_id="e", title="Role: You are an expert systems engineer")
+    )
     # Plain terminal is ignored
     assert not daemon._is_agent_surface(
         SurfaceRef(surface_id="d", title="~/Desktop/project", type="terminal")
     )
+
+
+def test_infer_agent_kind(fake_settings: Settings, fake_client, fake_scheduler):
+    from ysyl.models import SurfaceRef
+
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    assert daemon._infer_agent_kind(SurfaceRef(surface_id="a", resume_kind="claude")) == "claude"
+    assert daemon._infer_agent_kind(SurfaceRef(surface_id="b", resume_kind="kimi")) == "kimi"
+    assert daemon._infer_agent_kind(
+        SurfaceRef(surface_id="c", title="kimi session")
+    ) == "kimi"
+    assert daemon._infer_agent_kind(
+        SurfaceRef(surface_id="d", initial_command="claude --continue")
+    ) == "claude"
+    # "role:" is an agent surface but ambiguous; both detectors must run.
+    assert daemon._infer_agent_kind(
+        SurfaceRef(surface_id="e", title="Role: You are an expert systems engineer")
+    ) is None
+    assert daemon._infer_agent_kind(SurfaceRef(surface_id="f", title="vim")) is None
 
 
 @pytest.mark.asyncio
@@ -265,3 +329,128 @@ async def test_observe_marks_cleared_block_resumed(
     # No limit banner anymore -> the block cleared.
     daemon._observe("s1", "claude", "surface:1", "❯ all good, working normally", now)
     assert daemon._states["s1"].status == BlockStatus.RESUMED
+
+
+@pytest.mark.asyncio
+async def test_resume_surface_returns_true_on_success(
+    fake_settings: Settings, fake_client, fake_scheduler
+):
+    now = datetime.now(timezone.utc)
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    daemon._states["s1"] = BlockState(
+        surface_id="s1",
+        agent_kind="claude",
+        detected_at=now,
+        reset_at=now,
+        status=BlockStatus.SLEEPING,
+        armed=True,
+    )
+    result = await daemon._resume_surface("s1")
+    assert result is True
+    fake_client.send_text.assert_awaited_once_with("s1", "resume\n")
+    assert daemon._states["s1"].status == BlockStatus.RESUMED
+
+
+@pytest.mark.asyncio
+async def test_resume_surface_returns_false_for_missing_surface(
+    fake_settings: Settings, fake_client, fake_scheduler
+):
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    result = await daemon._resume_surface("missing")
+    assert result is False
+    fake_client.send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_observe_updates_agent_kind_on_re_detection(
+    fake_settings: Settings, fake_client, fake_scheduler
+):
+    now = datetime.now(timezone.utc)
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    # Surface was previously misclassified as kimi.
+    daemon._states["s1"] = BlockState(
+        surface_id="s1",
+        agent_kind="kimi",
+        detected_at=now,
+        reset_at=now + timedelta(hours=1),
+        status=BlockStatus.SLEEPING,
+        armed=True,
+        retry_count=3,
+    )
+    # New poll sees a Claude session-limit banner.
+    daemon._observe(
+        "s1",
+        "claude",
+        "surface:1",
+        "You've hit your session limit · resets 2:30 PM PDT",
+        now,
+        preferred_kind="claude",
+    )
+    assert daemon._states["s1"].agent_kind == "claude"
+    assert daemon._states["s1"].retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_states_removes_closed_and_old_rows(
+    fake_settings: Settings, fake_client, fake_scheduler
+):
+    now = datetime.now(timezone.utc)
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    daemon._states["old-resumed"] = BlockState(
+        surface_id="old-resumed",
+        agent_kind="claude",
+        detected_at=now - timedelta(hours=48),
+        reset_at=now,
+        status=BlockStatus.RESUMED,
+        armed=True,
+    )
+    daemon._states["closed"] = BlockState(
+        surface_id="closed",
+        agent_kind="claude",
+        detected_at=now,
+        status=BlockStatus.RESUMED,
+        armed=True,
+    )
+    daemon._states["live"] = BlockState(
+        surface_id="live",
+        agent_kind="claude",
+        detected_at=now,
+        status=BlockStatus.RESUMED,
+        armed=True,
+    )
+    daemon._prune_stale_states(now, {"live"})
+    assert "old-resumed" not in daemon._states
+    assert "closed" not in daemon._states
+    assert "live" in daemon._states
+
+
+def test_list_watched_includes_healthy_and_blocked_surfaces(
+    fake_settings: Settings, fake_client, fake_scheduler
+):
+    from ysyl.models import SurfaceRef
+
+    now = datetime.now(timezone.utc)
+    daemon = Daemon(config=fake_settings, client=fake_client, scheduler=fake_scheduler)
+    daemon._watched["healthy"] = SurfaceRef(
+        surface_id="healthy", ref="surface:1", title="ok"
+    )
+    daemon._watched["blocked"] = SurfaceRef(
+        surface_id="blocked", ref="surface:2", title="blocked"
+    )
+    daemon._states["blocked"] = BlockState(
+        surface_id="blocked",
+        agent_kind="claude",
+        detected_at=now,
+        reset_at=now + timedelta(hours=1),
+        status=BlockStatus.SLEEPING,
+        armed=True,
+        title="blocked",
+        ref="surface:2",
+    )
+    rows = daemon.list_watched()
+    by_id = {r["surface_id"]: r for r in rows}
+    assert len(rows) == 2
+    assert by_id["healthy"]["status"] == "healthy"
+    assert by_id["healthy"]["blocked"] is False
+    assert by_id["blocked"]["status"] == "sleeping"
+    assert by_id["blocked"]["blocked"] is True

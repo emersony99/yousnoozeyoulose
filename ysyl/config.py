@@ -83,11 +83,20 @@ class Settings(BaseSettings):
         default="continue",
         description="Text sent when resume_action='text' (a trailing newline is added).",
     )
+    agent_resume_actions: dict[str, str] = Field(
+        default_factory=lambda: {"claude": "text:resume", "kimi": "text:resume"},
+        description="Per-agent resume action. Values: 'enter' or 'text:<string>'.",
+    )
+    resume_verify_delay_seconds: float = Field(
+        default=1.0,
+        ge=0,
+        description="Seconds to wait after sending a resume keystroke before re-reading the surface.",
+    )
     max_retries: int = Field(
         default=5, ge=1, description="Resume attempts before a surface is auto-dismissed."
     )
     agent_title_patterns: list[str] = Field(
-        default_factory=lambda: ["claude", "kimi"],
+        default_factory=lambda: ["claude", "kimi", "role:"],
         description="Substrings (case-insensitive) that mark a surface title/command as an agent.",
     )
 
@@ -110,6 +119,22 @@ class Settings(BaseSettings):
         default=False,
         description="If true, capture surface text on every detection (not just unparsed resets).",
     )
+    debug_mode: bool = Field(
+        default=False,
+        description="If true, log extra diagnostics and capture every agent surface poll.",
+    )
+
+    # --- State hygiene ----------------------------------------------------
+    prune_resumed_after_hours: int = Field(
+        default=24,
+        ge=0,
+        description="Hours after which a 'resumed' block is removed from state (0 = never).",
+    )
+    prune_dismissed_after_hours: int = Field(
+        default=72,
+        ge=0,
+        description="Hours after which a 'dismissed' block is removed (0 = never).",
+    )
 
     # --- Web UI -----------------------------------------------------------
     ui_enabled: bool = Field(default=True, description="Serve the local dashboard while running.")
@@ -123,6 +148,19 @@ class Settings(BaseSettings):
         if normalized not in {"enter", "text"}:
             raise ValueError(f"resume_action must be 'enter' or 'text', got {value!r}")
         return normalized
+
+    @field_validator("agent_resume_actions", mode="before")
+    @classmethod
+    def _validate_agent_resume_actions(cls, value: dict[str, str]) -> dict[str, str]:
+        if not isinstance(value, dict):
+            raise ValueError("agent_resume_actions must be a dict")
+        for agent, action in value.items():
+            lowered = str(action).lower()
+            if lowered != "enter" and not lowered.startswith("text:"):
+                raise ValueError(
+                    f"agent_resume_actions['{agent}'] must be 'enter' or 'text:<string>', got {action!r}"
+                )
+        return value
 
     @field_validator("capture_dir", mode="before")
     @classmethod
