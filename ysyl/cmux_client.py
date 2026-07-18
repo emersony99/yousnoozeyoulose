@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import stat
 from pathlib import Path
 from typing import Any
@@ -193,36 +194,69 @@ class CmuxClient:
             return False, str(exc)
         return True, f"reachable ({len(surfaces)} surface(s))"
 
-    async def list_surfaces(self) -> list[SurfaceRef]:
-        """Return all cmux surfaces.
+    @staticmethod
+    def _extract_surfaces(result: Any) -> list:
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return result.get("surfaces", [])
+        return []
 
-        Real cmux returns ``{"surfaces": [{"id": ..., "ref": "surface:6",
-        "type": "terminal", "resume_binding": {"kind": "claude", ...}, ...}]}``.
-        We accept either that or a bare list, and key each surface by ``id``
-        (falling back to ``surface_id``).
+    @staticmethod
+    def _parse_surface(item: dict) -> SurfaceRef:
+        binding = item.get("resume_binding")
+        resume_kind = binding.get("kind") if isinstance(binding, dict) else None
+        checkpoint_id = binding.get("checkpoint_id") if isinstance(binding, dict) else None
+        cwd = binding.get("cwd") if isinstance(binding, dict) else None
+        return SurfaceRef(
+            surface_id=str(item.get("id") or item.get("surface_id") or ""),
+            ref=item.get("ref") or item.get("surface_ref"),
+            type=item.get("type"),
+            pane_ref=item.get("pane_ref"),
+            workspace_ref=item.get("workspace_ref"),
+            window_ref=item.get("window_ref"),
+            title=item.get("title"),
+            initial_command=item.get("initial_command"),
+            resume_kind=resume_kind,
+            checkpoint_id=checkpoint_id,
+            cwd=cwd or item.get("requested_working_directory"),
+        )
+
+    async def _list_workspace_ids(self) -> list[str]:
+        """All workspace ids in the window (cmux ``surface.list`` is per-workspace)."""
+        try:
+            result = await self._rpc("workspace.list")
+        except CmuxError:
+            return []
+        workspaces = result.get("workspaces", []) if isinstance(result, dict) else []
+        return [str(w["id"]) for w in workspaces if isinstance(w, dict) and w.get("id")]
+
+    async def list_surfaces(self) -> list[SurfaceRef]:
+        """Return cmux surfaces across **all** workspaces in the window.
+
+        ``surface.list`` only returns the currently-selected workspace, so we
+        enumerate every workspace and aggregate (deduping by surface id). Falls
+        back to the plain call if workspace enumeration is unavailable.
         """
-        result = await self._rpc("surface.list")
-        surfaces = result if isinstance(result, list) else result.get("surfaces", []) if isinstance(result, dict) else []
-        out: list[SurfaceRef] = []
-        for item in surfaces:
-            if not isinstance(item, dict):
+        raw: list[dict] = []
+        seen: set[str] = set()
+        for wid in await self._list_workspace_ids():
+            try:
+                result = await self._rpc("surface.list", {"workspace_id": wid})
+            except CmuxError:
                 continue
-            binding = item.get("resume_binding")
-            resume_kind = binding.get("kind") if isinstance(binding, dict) else None
-            out.append(
-                SurfaceRef(
-                    surface_id=str(item.get("id") or item.get("surface_id") or ""),
-                    ref=item.get("ref") or item.get("surface_ref"),
-                    type=item.get("type"),
-                    pane_ref=item.get("pane_ref"),
-                    workspace_ref=item.get("workspace_ref"),
-                    window_ref=item.get("window_ref"),
-                    title=item.get("title"),
-                    initial_command=item.get("initial_command"),
-                    resume_kind=resume_kind,
-                )
-            )
-        return out
+            for item in self._extract_surfaces(result):
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("id") or item.get("surface_id") or "")
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    raw.append(item)
+
+        if not raw:  # fallback: current workspace only
+            raw = [i for i in self._extract_surfaces(await self._rpc("surface.list")) if isinstance(i, dict)]
+
+        return [self._parse_surface(i) for i in raw]
 
     async def read_surface_text(self, surface_id: str) -> str:
         """Return the visible text of a surface, decoding base64 if needed."""
@@ -252,3 +286,85 @@ class CmuxClient:
     async def send_text(self, surface_id: str, text: str) -> None:
         """Send text to a surface."""
         await self._rpc("surface.send_text", {"surface_id": surface_id, "text": text})
+
+    async def open_saved_session(self, provider: str, session_id: str, cwd: str | None = None) -> bool:
+        """Open a terminal pane and resume the exact saved Claude/Codex session."""
+        if provider not in {"claude", "codex"}:
+            return False
+        existing_ids = {surface.surface_id for surface in await self.list_surfaces()}
+        command = (
+            f"claude --resume {shlex.quote(session_id)}"
+            if provider == "claude"
+            else f"codex resume {shlex.quote(session_id)}"
+        )
+        launch = f"cd {shlex.quote(cwd)} && exec {command}" if cwd else "exec " + command
+        args = self._base_args() + ["new-pane", "--type", "terminal", "--focus", "true"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._child_env(),
+            )
+        except OSError as exc:
+            raise CmuxError(
+                f"Could not launch cmux binary {self.cmux_bin!r}: {exc}",
+                command=args,
+                stderr=str(exc),
+            ) from exc
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise CmuxError(
+                "cmux new-pane exited with code " + str(proc.returncode),
+                command=args,
+                stderr=stderr.decode("utf-8", errors="replace").strip(),
+            )
+        surface_id = self._created_surface_id(stdout.decode("utf-8", errors="replace"))
+        if not surface_id:
+            # ``new-pane`` sometimes returns only a pane id. Resolve its newly
+            # created terminal surface instead of accidentally sending input to
+            # that pane container.
+            for _ in range(10):
+                await asyncio.sleep(0.1)
+                created = [
+                    surface.surface_id
+                    for surface in await self.list_surfaces()
+                    if surface.surface_id not in existing_ids
+                ]
+                if len(created) == 1:
+                    surface_id = created[0]
+                    break
+        if not surface_id:
+            raise CmuxError("cmux new-pane did not return a surface id", command=args)
+        # A newly-created terminal can acknowledge its id before the shell is
+        # attached. Wait until it renders something before typing; otherwise
+        # cmux silently drops the first paste on some terminals.
+        for _ in range(10):
+            await asyncio.sleep(0.2)
+            try:
+                if (await self.read_surface_text(surface_id)).strip():
+                    break
+            except CmuxError:
+                continue
+        await self.send_text(surface_id, launch + "\n")
+        return True
+
+    @staticmethod
+    def _created_surface_id(output: str) -> str | None:
+        """Extract the terminal id returned by cmux ``new-pane``."""
+        try:
+            result = json.loads(output)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(result, dict):
+            for key in ("surface_id", "surface_ref"):
+                value = result.get(key)
+                if value:
+                    return str(value)
+            surface = result.get("surface")
+            if isinstance(surface, dict):
+                value = surface.get("id") or surface.get("surface_id")
+                if value:
+                    return str(value)
+        return None

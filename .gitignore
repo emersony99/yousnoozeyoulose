@@ -33,3 +33,16 @@ env/
 .ysyl/
 state.json
 captures/
+
+# Generated local Graphify code graph
+graphify-out/
+AGENTS.md
+
+# Local agent/MCP tooling
+.codex/
+.playwright-mcp/
+
+# Scratch / debug artifacts
+page_scratch.txt
+*.jpeg
+!docs/*.jpeg

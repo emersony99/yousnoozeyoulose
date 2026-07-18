@@ -60,6 +60,18 @@ def test_kimi_falls_back_to_backoff_without_time():
     assert result.reset_at is None
 
 
+def test_kimi_detects_billing_cycle_usage_limit():
+    text = (
+        "Error: [provider.api_error] 403 You've reached your usage limit for this billing cycle.\n"
+        "https://www.kimi.com/membership/subscription?tab=quota"
+    )
+    result = KimiDetector().detect(text, now=NOW)
+    assert result is not None
+    assert result.agent_kind == "kimi"
+    assert result.reset_at is None
+    assert KimiDetector().detect("reached your usage limit for this billing cycle", now=NOW) is None
+
+
 def test_detect_all_returns_first_enabled_match():
     text = "Claude Code\nYour usage will reset at 3:00 PM PST"
     result = detect_all(text, NOW, enabled={"claude": True, "kimi": True})
@@ -113,6 +125,18 @@ def test_claude_detects_session_limit():
     assert result is not None
     assert result.agent_kind == "claude"
     assert result.reset_at is not None
+
+
+def test_claude_detects_stop_and_wait_quota_dialog():
+    text = (
+        "What do you want to do?\n\n"
+        "  1. Stop and wait for limit to reset\n"
+        "  2. Upgrade your plan\n"
+    )
+    result = ClaudeDetector().detect(text, now=NOW)
+    assert result is not None
+    assert result.agent_kind == "claude"
+    assert result.reset_at is None
 
 
 def test_claude_weak_rate_limit_without_reset_is_ignored():

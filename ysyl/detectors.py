@@ -98,6 +98,10 @@ class ClaudeDetector:
         r"too many requests",
         r"approaching (?:your )?usage limit",
         r"out of (?:usage|credits)",
+        # Claude Code's interactive quota dialog does not repeat "usage limit".
+        # Match the full pair of choices to avoid treating normal conversation as a block.
+        r"what do you want to do\?[\s\S]{0,200}"
+        r"stop and wait for limit to reset[\s\S]{0,200}upgrade your plan",
     )
 
     # Weak phrases: they appear in ordinary conversation about rate limits and
@@ -111,7 +115,9 @@ class ClaudeDetector:
     # Absolute reset time: "reset at 2:30 PM PDT", "resets 3pm (America/New_York)",
     # "reset at 15:00 UTC", "resets 3pm".
     _RESET_ABSOLUTE_RE = re.compile(
-        r"reset[a-z]*\s*(?:at|by)?\s*"
+        # Horizontal whitespace keeps a following menu choice ("reset\n1.")
+        # from being parsed as a 1:00 reset time.
+        r"reset[a-z]*[ \t]*(?:at|by)?[ \t]+"
         r"(\d{1,2})(?::(\d{2}))?\s*"
         r"([ap]\.?m\.?)?\s*"
         r"(?:\(([A-Za-z]+/[A-Za-z_]+)\)|([A-Za-z]{2,4}))?",
@@ -145,7 +151,7 @@ class ClaudeDetector:
 
         return BlockState(
             surface_id="",
-            agent_kind="claude",
+            agent_kind=self.agent_kind,
             detected_at=now,
             reset_at=reset_at,
             status="detected",
@@ -200,6 +206,12 @@ class KimiDetector:
         r"insufficient quota",
         r"retry after",
     )
+    _BILLING_CYCLE_LIMIT_RE = re.compile(
+        r"(?=.*\[provider\.api_error\]\s*403)"
+        r"(?=.*\breached your usage limit for this billing cycle\b)"
+        r"(?=.*https?://(?:www\.)?kimi\.com/membership(?:/|\?|\b))",
+        re.IGNORECASE | re.DOTALL,
+    )
     _RETRY_SECONDS_RE = re.compile(
         r"(?:retry after|try again in)\s+(\d+)\s*(?:s|sec|seconds?)\b",
         re.IGNORECASE,
@@ -215,7 +227,7 @@ class KimiDetector:
 
     def detect(self, text: str, *, now: datetime | None = None) -> BlockState | None:
         now = now or datetime.now(timezone.utc)
-        if not self._indicators_re.search(text):
+        if not (self._indicators_re.search(text) or self._BILLING_CYCLE_LIMIT_RE.search(text)):
             return None
 
         reset_at: datetime | None = None
@@ -236,6 +248,17 @@ class KimiDetector:
         )
 
 
+class CodexDetector(ClaudeDetector):
+    """Detect OpenAI Codex CLI usage / rate-limit banners.
+
+    Codex's English limit wording overlaps Claude's ("usage limit", "rate limit",
+    "try again in …"), so we reuse the same banner/reset patterns but tag the
+    detection as ``codex``. Extra patterns can be supplied via config.
+    """
+
+    agent_kind = "codex"
+
+
 def build_detectors(
     banner_patterns: dict[str, list[str]] | None = None,
 ) -> list[AgentDetector]:
@@ -247,6 +270,7 @@ def build_detectors(
     banner_patterns = banner_patterns or {}
     return [
         ClaudeDetector(extra_banner_patterns=banner_patterns.get("claude")),
+        CodexDetector(extra_banner_patterns=banner_patterns.get("codex")),
         KimiDetector(extra_indicator_patterns=banner_patterns.get("kimi")),
     ]
 
@@ -270,7 +294,7 @@ def detect_all(
             that detector is run. This prevents a Claude Code session whose
             conversation happens to mention Kimi from being misclassified.
     """
-    enabled = enabled or {"claude": True, "kimi": True}
+    enabled = enabled or {"claude": True, "codex": True, "kimi": True}
     detectors = detectors if detectors is not None else build_detectors()
     for detector in detectors:
         if preferred_kind and detector.agent_kind != preferred_kind:

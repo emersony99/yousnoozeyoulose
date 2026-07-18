@@ -97,6 +97,35 @@ async def test_send_text_invokes_rpc():
 
 
 @pytest.mark.asyncio
+async def test_open_saved_session_uses_terminal_and_exact_resume_command(monkeypatch):
+    cmock = await _run_with_mock_subprocess(stdout=b'{"surface_id": "new-surface"}')
+    client = CmuxClient()
+    monkeypatch.setattr("ysyl.cmux_client.asyncio.sleep", AsyncMock())
+    client.list_surfaces = AsyncMock(return_value=[])
+
+    assert await client.open_saved_session("claude", "session-1", "/tmp/project") is True
+    args = cmock.call_args[0]
+    assert args[:5] == ("cmux", "rpc", "surface.send_text", '{"surface_id": "new-surface", "text": "cd /tmp/project && exec claude --resume session-1\\n"}')
+    first_args = cmock.call_args_list[0][0]
+    assert first_args[:5] == ("cmux", "new-pane", "--type", "terminal", "--focus")
+    assert first_args[5:] == ("true",)
+    assert await client.open_saved_session("kimi", "session-1", "/tmp/project") is False
+
+
+@pytest.mark.asyncio
+async def test_open_saved_session_resolves_new_terminal_when_cmux_returns_only_a_pane_id(monkeypatch):
+    cmock = await _run_with_mock_subprocess(stdout=b'{"pane_id": "pane-1"}')
+    client = CmuxClient()
+    monkeypatch.setattr("ysyl.cmux_client.asyncio.sleep", AsyncMock())
+    client.list_surfaces = AsyncMock(side_effect=[[], [MagicMock(surface_id="terminal-1")]])
+
+    assert await client.open_saved_session("codex", "session-1") is True
+    assert json.loads(cmock.call_args[0][3]) == {
+        "surface_id": "terminal-1", "text": "exec codex resume session-1\n"
+    }
+
+
+@pytest.mark.asyncio
 async def test_nonzero_exit_raises_cmux_error():
     await _run_with_mock_subprocess(stdout=b"", stderr=b"boom", returncode=1)
     client = CmuxClient()
@@ -134,7 +163,7 @@ async def test_rpc_retries_transient_broken_pipe():
         return {"surfaces": []}
 
     client._rpc_once = fake
-    assert await client.list_surfaces() == []
+    assert await client._rpc("surface.list") == {"surfaces": []}
     assert calls["n"] == 3  # retried twice, succeeded on the third
 
 
@@ -149,7 +178,7 @@ async def test_rpc_does_not_retry_non_transient():
 
     client._rpc_once = fake
     with pytest.raises(CmuxError):
-        await client.list_surfaces()
+        await client._rpc("surface.list")
     assert calls["n"] == 1  # not retried
 
 

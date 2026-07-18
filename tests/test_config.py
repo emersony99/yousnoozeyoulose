@@ -39,3 +39,19 @@ def test_explicit_bin_overrides_resolution(tmp_path, monkeypatch):
     exe = _make_exe(tmp_path / "cmux")
     monkeypatch.setenv("CMUX_BUNDLED_CLI_PATH", str(exe))
     assert Settings(cmux_bin="/custom/cmux", ui_enabled=False).cmux_bin == "/custom/cmux"
+
+
+def test_history_window_sets_prune_hours():
+    s = Settings(history_window="3d", ui_enabled=False)
+    assert s.prune_resumed_after_hours == 72
+    assert s.prune_dismissed_after_hours == 72
+
+    s = Settings(history_window="3w", ui_enabled=False)
+    assert s.prune_resumed_after_hours == 504
+    assert s.prune_dismissed_after_hours == 504
+
+
+def test_history_window_rejects_invalid_value():
+    import pytest
+    with pytest.raises(ValueError):
+        Settings(history_window="1month", ui_enabled=False)

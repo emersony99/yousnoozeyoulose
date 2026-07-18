@@ -6,6 +6,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import shlex
+import signal
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stdout", action="store_true", help="Print to stdout instead of the capture dir."
     )
 
+    subparsers.add_parser("stopall", help="Stop all running YSYL daemons for this user.")
     subparsers.add_parser("doctor", help="Diagnose cmux connectivity.")
 
     return parser
@@ -114,6 +119,103 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_ysyl_run_command(command: str) -> bool:
+    """Return whether a process command explicitly launches ``ysyl run``."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+
+    for index, part in enumerate(parts[:-1]):
+        if parts[index + 1] != "run" or Path(part).name != "ysyl":
+            continue
+        # Direct ``ysyl run`` or the console script under a Python interpreter.
+        if index == 0 or Path(parts[0]).name.lower().startswith("python"):
+            return True
+
+    for index, part in enumerate(parts[:-2]):
+        if (
+            part == "-m"
+            and parts[index + 1] in {"ysyl", "ysyl.__main__", "ysyl.cli"}
+            and parts[index + 2] == "run"
+        ):
+            return True
+
+    return False
+
+
+def _find_ysyl_daemon_pids() -> list[int]:
+    """List current-user YSYL daemon PIDs without matching unrelated commands."""
+    try:
+        result = subprocess.run(
+            ["ps", "-xww", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"could not list processes: {exc}") from exc
+
+    if result.returncode:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        raise RuntimeError(f"could not list processes: {detail}")
+
+    current_pid = os.getpid()
+    pids: set[int] = set()
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        if pid <= 0 or pid == current_pid or not _is_ysyl_run_command(fields[1]):
+            continue
+        pids.add(pid)
+
+    return sorted(pids)
+
+
+def _cmd_stopall(args: argparse.Namespace) -> int:
+    """Request a graceful shutdown from every current-user YSYL daemon."""
+    del args
+    try:
+        pids = _find_ysyl_daemon_pids()
+    except RuntimeError as exc:
+        print(f"Failed to stop YSYL daemons: {exc}", file=sys.stderr)
+        return 1
+
+    if not pids:
+        print("No running YSYL daemons found.")
+        return 0
+
+    stopped: list[int] = []
+    failed: list[tuple[int, str]] = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # The process exited after the scan; its intended end state is met.
+            continue
+        except PermissionError:
+            failed.append((pid, "permission denied"))
+        except OSError as exc:
+            failed.append((pid, str(exc)))
+        else:
+            stopped.append(pid)
+
+    if stopped:
+        noun = "daemon" if len(stopped) == 1 else "daemons"
+        print(f"Requested shutdown for {len(stopped)} YSYL {noun}: {', '.join(map(str, stopped))}")
+    elif not failed:
+        print("No running YSYL daemons found.")
+
+    for pid, error in failed:
+        print(f"Could not stop YSYL daemon {pid}: {error}", file=sys.stderr)
+    return 1 if failed else 0
+
+
 def _read_blocks(state_file: Path) -> list[dict]:
     data = json.loads(state_file.read_text(encoding="utf-8"))
     if isinstance(data, list):
@@ -170,9 +272,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for r in rows:
         name = (r.get("title") or r.get("ref") or r.get("surface_id") or "")[:29]
         armed = "yes" if r.get("armed", True) else "no"
+        status = str(r.get("status", ""))
+        if not r.get("live", True):
+            status = "closed"
         print(
             f"{name:<30} {str(r.get('agent_kind') or ''):<7} "
-            f"{str(r.get('status','')):<10} {armed:<6} "
+            f"{status:<10} {armed:<6} "
             f"{_fmt_countdown(r.get('reset_at')):<12} {r.get('retry_count',0):<5}"
         )
     return 0
@@ -310,6 +415,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_dismiss(args)
     if args.command == "capture":
         return _cmd_capture(args)
+    if args.command == "stopall":
+        return _cmd_stopall(args)
     if args.command == "doctor":
         return _cmd_doctor(args)
     parser.print_help()

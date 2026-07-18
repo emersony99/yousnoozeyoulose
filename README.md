@@ -10,8 +10,10 @@ rate-limit blocks, parses the reset time, and automatically resumes the agent
 once the quota refreshes — so a limit that hits while you're away doesn't cost
 you the rest of your session.
 
-It ships with a **minimal local dashboard** so you can see exactly what it's
+It ships with a **local Recovery Desk dashboard** so you can see exactly what it's
 locked onto and choose what gets auto-resumed.
+
+![The ysyl Recovery Desk dashboard](docs/dashboard.jpeg)
 
 ## How it works
 
@@ -30,7 +32,7 @@ locked onto and choose what gets auto-resumed.
    it backs off and retries, up to a configurable cap. The action is configurable
    per agent kind via `agent_resume_actions`.
 
-Only surfaces recognised as agents are ever read or resumed.
+The dashboard header has a **History** dropdown to switch between keeping 3 days, 1 week (default), or 3 weeks of session history without editing a config file.
 
 ## Requirements
 
@@ -72,6 +74,12 @@ Run the daemon (dashboard on http://127.0.0.1:8765 by default):
 
 ```bash
 ysyl run
+```
+
+Stop every running YSYL daemon owned by the current user:
+
+```bash
+ysyl stopall
 ```
 
 Override the polling interval, scheduler tick, dashboard port, or state file:
@@ -185,8 +193,9 @@ the current or home directory. Useful keys:
 | `capture_on_detect` | `false` | Capture surface text on every detection |
 | `debug_mode` | `false` | Capture every agent poll and log detector decisions |
 | `detector_banner_patterns` | `{}` | Extra regexes appended per agent kind |
-| `prune_resumed_after_hours` | `24` | Remove stale 'resumed' rows from state |
-| `prune_dismissed_after_hours` | `72` | Remove stale 'dismissed' rows from state |
+| `history_window` | `1w` | Keep session history: `3d`, `1w`, or `3w`. Also editable in the dashboard. |
+| `prune_resumed_after_hours` | `168` | Advanced override for `history_window` |
+| `prune_dismissed_after_hours` | `168` | Advanced override for `history_window` |
 | `resume_verify_delay_seconds` | `1.0` | Wait this long after a resume keystroke before re-reading |
 | `ui_enabled` / `ui_host` / `ui_port` | `true` / `127.0.0.1` / `8765` | Dashboard |
 

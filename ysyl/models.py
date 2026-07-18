@@ -13,6 +13,7 @@ class AgentKind(StrEnum):
     """Known agent kinds that the daemon can detect and resume."""
 
     CLAUDE = "claude"
+    CODEX = "codex"
     KIMI = "kimi"
 
 
@@ -47,13 +48,19 @@ class SurfaceRef(BaseModel):
         default=None,
         description="Agent kind from cmux resume_binding (e.g. 'claude'), if any.",
     )
+    checkpoint_id: str | None = Field(
+        default=None,
+        description="Agent session id from cmux resume_binding.checkpoint_id. For Claude "
+        "this equals the ~/.claude/projects/<cwd>/<id>.jsonl session file stem.",
+    )
+    cwd: str | None = Field(default=None, description="Working directory of the surface, if known.")
 
 
 class BlockState(BaseModel):
     """Persisted state of a detected agent block on a surface."""
 
     surface_id: str = Field(..., description="Surface where the block was detected.")
-    agent_kind: Literal["claude", "kimi"] = Field(..., description="Agent kind detected.")
+    agent_kind: Literal["claude", "codex", "kimi"] = Field(..., description="Agent kind detected.")
     detected_at: datetime = Field(..., description="UTC timestamp when the block was first detected.")
     reset_at: datetime | None = Field(default=None, description="UTC timestamp when the quota is expected to reset.")
     retry_count: int = Field(default=0, ge=0, description="Number of resume attempts after the block.")
@@ -65,6 +72,14 @@ class BlockState(BaseModel):
     title: str | None = Field(default=None, description="Last-seen surface title, for display.")
     ref: str | None = Field(default=None, description="Last-seen surface ref, for display.")
     preview: str | None = Field(default=None, description="Short tail of surface text, for display.")
+    resumed_by_ysyl: bool = Field(
+        default=False,
+        description="Whether YSYL launched this session in a new terminal after detecting its limit.",
+    )
+    resumed_at: datetime | None = Field(
+        default=None,
+        description="UTC timestamp when YSYL successfully delivered a resume action.",
+    )
 
     def to_state_dict(self) -> dict:
         """Serialize to a JSON-friendly dict with ISO timestamps."""
@@ -79,6 +94,8 @@ class BlockState(BaseModel):
             "title": self.title,
             "ref": self.ref,
             "preview": self.preview,
+            "resumed_by_ysyl": self.resumed_by_ysyl,
+            "resumed_at": self.resumed_at.isoformat() if self.resumed_at else None,
         }
 
     @classmethod
@@ -95,4 +112,6 @@ class BlockState(BaseModel):
             title=data.get("title"),
             ref=data.get("ref"),
             preview=data.get("preview"),
+            resumed_by_ysyl=data.get("resumed_by_ysyl", False),
+            resumed_at=datetime.fromisoformat(data["resumed_at"]) if data.get("resumed_at") else None,
         )

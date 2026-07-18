@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Common macOS install location, used as a last resort.
@@ -71,9 +71,51 @@ class Settings(BaseSettings):
         "ysyl runs outside a cmux surface). Defaults to the CMUX_SOCKET_PASSWORD env var.",
     )
     state_file: str = Field(default="~/.ysyl/state.json", description="Path to persistent state file.")
+    sessions_file: str = Field(
+        default="~/.ysyl/sessions.json",
+        description="Path to the persistent session ledger (every agent session ysyl has seen).",
+    )
+    claude_projects_dir: str = Field(
+        default="~/.claude/projects",
+        description="Where Claude Code stores per-session history, used to backfill past sessions.",
+    )
+    backfill_claude_history: bool = Field(
+        default=True,
+        description="Also list past Claude sessions found on disk (not just ones ysyl watched live).",
+    )
+    codex_sessions_dir: str = Field(
+        default="~/.codex/sessions",
+        description="Where the Codex CLI stores per-session rollout history.",
+    )
+    backfill_codex_history: bool = Field(
+        default=True, description="Also list past Codex sessions found on disk."
+    )
+    kimi_index_file: str = Field(
+        default="~/.kimi-code/session_index.jsonl",
+        description="Kimi's session index (maps sessionId -> sessionDir), used to backfill Kimi sessions.",
+    )
+    backfill_kimi_history: bool = Field(
+        default=True, description="Also list past Kimi sessions found on disk."
+    )
+    active_idle_gap_seconds: int = Field(
+        default=300,
+        ge=1,
+        description="Active-time cutoff: a gap between session events longer than this "
+        "counts as idle, not uptime. Used for the agent uptime breakdown.",
+    )
+    present_idle_gap_seconds: int = Field(
+        default=1800,
+        ge=1,
+        description="Downtime cutoff: a gap between active_idle_gap_seconds and this counts "
+        "as 'present but idle' (downtime); longer gaps are 'away' and are not counted.",
+    )
+    settings_file: str = Field(
+        default="~/.ysyl/settings.json",
+        description="Path to runtime UI-editable settings file.",
+    )
     log_level: str = Field(default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR).")
     agents: dict[str, bool] = Field(
-        default_factory=lambda: {"claude": True, "kimi": True},
+        default_factory=lambda: {"claude": True, "codex": True, "kimi": True},
         description="Map of agent name to detection enabled flag.",
     )
 
@@ -103,7 +145,7 @@ class Settings(BaseSettings):
         default=5, ge=1, description="Resume attempts before a surface is auto-dismissed."
     )
     agent_title_patterns: list[str] = Field(
-        default_factory=lambda: ["claude", "kimi", "role:"],
+        default_factory=lambda: ["claude", "codex", "kimi", "role:"],
         description="Substrings (case-insensitive) that mark a surface title/command as an agent.",
     )
 
@@ -132,13 +174,17 @@ class Settings(BaseSettings):
     )
 
     # --- State hygiene ----------------------------------------------------
+    history_window: str = Field(
+        default="1w",
+        description="How far back to keep session history: '3d', '1w', or '3w'.",
+    )
     prune_resumed_after_hours: int = Field(
-        default=24,
+        default=168,
         ge=0,
         description="Hours after which a 'resumed' block is removed from state (0 = never).",
     )
     prune_dismissed_after_hours: int = Field(
-        default=72,
+        default=168,
         ge=0,
         description="Hours after which a 'dismissed' block is removed (0 = never).",
     )
@@ -187,6 +233,24 @@ class Settings(BaseSettings):
     @classmethod
     def _expand_state_file(cls, value: str) -> str:
         return str(Path(value).expanduser())
+
+    @field_validator("settings_file", mode="before")
+    @classmethod
+    def _expand_settings_file(cls, value: str) -> str:
+        return str(Path(value).expanduser())
+
+    @model_validator(mode="after")
+    def _apply_history_window(self) -> "Settings":
+        mapping = {"3d": 72, "1w": 168, "3w": 504}
+        window = str(self.history_window).lower()
+        if window not in mapping:
+            raise ValueError(
+                f"history_window must be one of {list(mapping.keys())}, got {self.history_window!r}"
+            )
+        hours = mapping[window]
+        self.prune_resumed_after_hours = hours
+        self.prune_dismissed_after_hours = hours
+        return self
 
     @classmethod
     def settings_customise_sources(
