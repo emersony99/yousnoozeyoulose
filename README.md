@@ -1,5 +1,7 @@
 # YouSnoozeYouLose (ysyl)
 
+![ysyl — the rate limit hits while you sleep; ysyl resumes your agent the moment the quota refreshes](docs/promo/00-hero-night-desk.png)
+
 [![CI](https://github.com/emersony99/yousnoozeyoulose/actions/workflows/ci.yml/badge.svg)](https://github.com/emersony99/yousnoozeyoulose/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -14,6 +16,17 @@ It ships with a **local Recovery Desk dashboard** so you can see exactly what it
 locked onto and choose what gets auto-resumed.
 
 ![The ysyl Recovery Desk dashboard](docs/dashboard.jpeg)
+
+## The story
+
+The limit hits at 2am. You're asleep. Without ysyl, the rest of your session
+just... waits. With it, the moment the quota refreshes the machine picks up
+right where it left off.
+
+| The limit hits | Reset time comes | The desk sits idle | ysyl resumes |
+|:---:|:---:|:---:|:---:|
+| ![Claude session hits its usage limit](docs/promo/01-limit-hit.png) | ![The clock reaches the reset time](docs/promo/02-reset-time.png) | ![The dim, idle desk at night](docs/promo/03-idle.png) | ![The screen blazes back to life as ysyl resumes the agent](docs/promo/04-resume.png) |
+| `usage limit reached — resets at 3:00 AM` | the clock rolls over | dark, quiet, waiting | the screen lights up and work continues |
 
 ## How it works
 
